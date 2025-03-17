@@ -1,0 +1,690 @@
+---
+title: "141A Final Project"
+author: "Samuel Pereira"
+output: html_document
+---
+
+```{r echo=FALSE, message=FALSE}
+suppressWarnings(library(dplyr))
+suppressWarnings(library(ggplot2))
+suppressWarnings(library(readr))
+suppressWarnings(library(tidyverse))
+suppressWarnings(library(caret))
+suppressWarnings(library(pROC))
+suppressWarnings(library(glmnet))
+suppressWarnings(library(gridExtra))
+```
+
+## Abstract
+
+We took data from a study that, as part of their data collection process, had various mice perform a specific trial that they could succeed or fail at over a number of sessions, using the trial as a way to encourage brain activity to analyze. Using RStudio, data integration techniques, and K-fold cross validation, we constructed a prediction model off of data from roughly half of the sessions which aimed to accurately predict whether a mouse would succeed or fail at a given trial when provided with the circumstances of that trial and the brain activity that occurred within it. Our model performed inconsistently. In rudimentary testing, it usually (but not always) slightly outperformed a comparative model that assumed success for every trial, and when provided with test data, it was only tying the comparative model at best and getting heavily outperformed at worst. Analyzing the results revealed that the model struggled with overpredicting successes and not properly predicting failures, and futher analyzing the coefficients used to make up the model provided insight into various manners by which it could be improved.
+
+***
+
+## Introduction
+
+In 2019, Nicholas A. Steinmetz, Peter Zatka-Hass, Matteo Carandini, and Kenneth D. Harris put together an experiment in order to analyze the way that mouse brains react when provided with a task. The experiment involved putting a mouse in front of a wheel and showing it three screens, arranged in a row. In each trial of the experiment, the left and right screens displayed varying contrasts of colors, with the strength of the contrast on either screen ranging from 0 (nothing displayed) to 1, taking values of {0, 0.25, 0.5, 0.75, 1}. The mouse had a wheel in front of it that it could either turn to the left, turn to the right, or not turn at all upon seeing the screens. The results of each trial were determined as follows:
+
+* If neither screen displayed anything, success meant holding the wheel still, with the other two options resulting in failure.
+* If the left contrast had a higher strength than the right contrast, success meant turning the wheel to the right, with the other two options resulting in failure.
+* If the right contrast had a higher strength than the left contrast, success meant turning the wheel to the left, with the other two options resulting in failure.
+* If both screens were displaying contrasts of equal strength, the direction for success was randomly chosen, with turning the wheel left or turning the wheel right each having a 50% chance to be the correct choice. Not turning the wheel in this scenario always resulted in failure.
+
+Each session of the experiment involved one of a number of mice undergoing a few hundred trials, with successes and failures being recorded, receiving a water reward whenever they took the correct action. Throughout each session, the contrasts displayed, the mouse's successes and failures, and the activity of the mouse's neurons in specific parts of the brain (changing with each session) were all recorded. The point of the experiment was to provide the mouse with a task to complete in order to determine which parts of its brain would react when seeing the contrasts, choosing to engage with the experiment instead of staying still, or choosing which way to turn the wheel.
+
+Today, we're looking at this dataset with a different goal; using the various data from 18 of the 39 sessions in order to construct a predictive model that can take the data of a given trial (both the experimental setup and the neuron records) and predict whether the mouse succeeded or failed. The work of Steinmetz et al. involved other experiments (such as seeing if the mouse would still participate in the trials if it didn't receive a reward for doing so), but for our purposes, we will only be focusing on the previously described experiment for the creation of our model.
+
+***
+
+## Data Analysis
+
+A total of 18 RDS files are provided that contain the records from 18 sessions of the experiment run by Steinmetz et al. We can begin our analysis by summarizing the information from the selected sessions.
+
+We start by importing the data from the 18 sessions.
+
+```{r message=FALSE}
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+}
+```
+
+Each session contains 8 variables:
+
+* The mouse's name (under "mouse_name"). Cori was the subject for sessions 1-3, Forssman was the subject for sessions 4-7, Hench was the subject for sessions 8-11, and Lederberg was the subject for the last seven sessions in our dataset.
+* The date that the experiment was conducted (under "date_exp"). This is mostly helpful for displaying that the sessions occurred in the order that they're numbered, with 1 being the first session and 18 being the last.
+* The left contrast and right contrast that the mouse viewed for each of the trials (under "contrast_left" and "contrast_right" respectively). Unsurprisingly, there's one pair of values for every trial in a given session. These are actually two separate variables, but they're both under this bullet point because of their similar structure.
+* The feedback type for each trial. These are either 1 or -1, representing that the mouse gave the correct or incorrect answer for that respective trial.
+* The record of which neurons spiked during the session (under "spks"). There's a matrix for every trial, with one axis representing every neuron being measured in that session and the other axis representing the 40 "time bins" where the neuron could have potentially been firing during that trial.
+* A list of brain areas corresponding to each of the neurons being measured (under "brain_area"). Values in this list can be applied to the corresponding neurons in any of the session's trial to label them.
+* The specific time corresponding to each of the "time bins" where the neurons were being measured (under "time"). There's a list of 40 times per trial, each one corresponding to a specific 1/100th of a second. Similarly to the date variable, this is useful for displaying that all of the trials occurred one after the other.
+
+***
+
+Now that we know what we're dealing with, let's try to consider the variables that could help us understand the feedback returned by one individual trial. The first thing to look at is the contrasts, and there's a lot to cover.
+
+One likely suspect in terms of predicting the chance of success is the difference between the two contrasts. A larger difference between contrasts could in theory make it easier for a mouse to determine which had a higher level, so separating out the absolute value of the difference would likely be a good place to start.
+
+However, only including a "difference in contrasts" variable misses an important piece of the experimental setup. A mouse succeeded when both contrast levels were zero by not moving the wheel, but when both contrast levels were equal and nonzero, the successful direction was chosen randomly. These are two different scenarios, but both of them are expressed by a "difference in contrasts" of zero. Therefore, if the difference in contrasts are zero but the contrasts themselves are not, we should note that with an additional categorical factor, returning "no" if the contrast levels were both zero and returning "yes" if the contrast levels were equal but nonzero. We'll call this the "luck factor", since it being involved means that success was determined by luck rather than any predetermined rules.
+
+Using only the absolute value of a difference in contrasts is a good start, but it discounts another factor that could theoretically have an effect: what if certain mice have an easier time seeing stronger contrasts on one side? I'm not sure why this would be the case (maybe one of their eyes is weaker?), but the best way to test for this would probably be to add a categorical factor that returns "none" if the contrast levels are equal, "left" if the left side has a stronger contrast, and "right" if the right side has a stronger contrast. This is preferable to the other manner of testing this (using the integer difference instead of the absolute value difference) because it separates out the potentially confounding variable, making it easier to test it separately later on. We'll call this the "side factor".
+
+Additionally, the specific mouse used in the trial may have an effect on the odds of success. Perhaps one mouse is better at this task than the others, or perhaps, as mentioned previously when justifying the inclusion of the side factor, certain mice are better at trials where the contrast is higher on one particular side.
+
+Building off of this, the main way in which the session number could affect the results is if the mice get more used to the experiment and end up performing better over time. In that case, we shouldn't be looking at the session number as 1-18; instead, we should look at it from the perspective of "which session is it for the mouse?". Since we know that every mouse had all of their sessions consecutively, we can get this value by resetting the session number to 1 every time we switch mice, which are in sessions 4, 8, and 12. The easiest way to do this is just checking if the session number is within a certain range and subtracting the number of previous sessions that didn't include that mouse. We'll call this the "mouse session number" to distinguish it from the session number.
+
+Similarly, the trial number within the session is probably worth noting as well. Perhaps, as the session continues, the mouse starts to get acclimated to the experimental conditions and gets rewards more consistently as a result.
+
+***
+
+Finally, we turn to the neurons. However, there's a big problem that arises when trying to analyze the neurons, and it's immediately obvious upon looking at the brain areas in each section:
+
+```{r echo=FALSE, message=FALSE}
+n.session=length(session)
+
+problem = tibble(
+  sess.num = rep(0, n.session),
+  brain.areas = rep("areas", n.session)
+)
+
+for(i in 1:n.session) {
+  problem[i, 1] = i;
+  problem[i, 2] = toString(unique(session[[i]]$brain_area))
+}
+
+knitr::kable(problem, format = "html", table.attr = "class='table table-striped'",col.names=c("Session", "Brain Areas"))
+```
+
+The problem is that not every session is looking at the same areas of the brain (i.e. the data is heterogeneous). This is particularly problematic because a brain area not being recorded in a given session doesn't mean that the brain area isn't doing anything. The sessions weren't looking at the only brain areas that were active; all of the brain was active, and the individual sessions were only checking on specific brain areas while not paying attention to others.
+
+The original study by Steinmetz et al. was attempting to determine which areas of the brain became more or less active when provided with the given task. Looking at different areas of the brain across different sessions works very well for this objective, but when trying to build a predictive model that spans all of these sessions, it makes properly filling in the gaps rather difficult.
+
+If we were to construct data that puts emphasis on which brain area is spiking during a trial, it runs into the problem that specific areas of the brain that were absolutely active during that point in time simply have no data. If we were to make a prediction model that treats every single brain area as a factor and assumes that brain areas that weren't recorded in a session all had zero activity across the board, it will lead to all of the brain areas having strange weights in the model; if a portion of the entire dataset leads to successes despite a given brain area being recorded as having zero spikes in many of them, it will cause the model to be structured as if that brain area has only a small effect on the data as a whole (due to the brain area's average value plummeting), and that will have an adverse effect on the predictions for the sessions where that brain area actually has values.
+
+The project guidelines suggest that perhaps there are underlying groups of neurons with similar effects. For instance, if MOs, LSr, CA3, SUB, and EPd were all grouped together (this example is not backed up by any data and is merely for illustrative purposes), then a session missing any number of them would still produce a value for the "group" of brain areas by simply taking the average of the values that it does have. However, this runs into the same issue; if this "group" is a factor in the final prediction model, how will the model handle session 6 or session 17, which contain none of the members of this group? This risk is frustrating to manually check.
+
+Ultimately, the goal of this project is not to determine whether certain brain areas are better predictors of success. Nor is it, as Steinmetz et al. were focusing on, to determine whether certain brain areas became more active during the trials. Instead, the goal is to make a predictive model that can use the data in any given trial from any session to guess whether the mouse succeeded in it. Worrying about the specific values of individual brain areas only matters if they ultimately make a meaningful impact on the predictive model, something that isn't certain.
+
+That being said, the original study by Steinmetz et al. was focusing on seeing how the brain acts when the mice *chose* to interact with the experiment, a choice likely made in the first few hundredths of a second. Given that the experiment was explicitly designed to encourage mice brain function, it's very likely that heavy brain activity in the first few time bins would've been predictive of the mouse interacting with the experiment, which could in turn predict successes if the wheel had to be turned (left > right, right < left) or failures if it didn't (left = right = 0).
+
+As such, instead of focusing on *where* the brain is active, we'll focus specifically on *if* it's active, and if so, *when* it's active. To determine this, we'll do the following for each trial.
+
+1. For each of the time bins, take the total of all of the spikes that occurred and divide it by the number of neurons. This condenses all of the neurons for each bin into a single factor of how active the brain was during that hundredth of a second, while still controlling for sessions that include more neurons than the rest.
+2. Take the total of the averages for the first ten time bins. This will give us a singular data point that provides a general idea of how active the brain was at the very start of the trial.
+3. Take the total of the averages for all of the time bins. This will give us a second singular data point that provides a general idea of how active the brain was throughout the trial, which will help show if the 0.1 seconds represented by the data point in #2 continued throughout the rest of the 0.4 seconds we're looking at. This in turn will help catch if the mouse's focus is just a flash at the start, if it stays constant (throughout the limited time we're looking at, at least), or if it takes the mouse a few tenths of a second to start noticing things.
+
+Since this is meant to see if the mouse is focusing on the experiment, the point mentioned in #2 will be called the "initial focus" and the point in #3 will be called the "overall focus".
+
+This method of dividing the time bins is rather arbitrary and is mostly based on the assumption that the important factors are "is the mouse paying attention at the start" and "does the mouse continue to pay attention". The important idea here is the concepts rather than the specific number or size of the variables representing them, and they could potentially be adjusted to fine-tune the model if it performs decently well.
+
+***
+
+The remaining factors will not be considered. Time bin labels aren't particularly useful except for discerning how deep into the session we are, something that we're already considering through the trial number, and the experiment date is essentially just a wordier representation of the session number, something that we're already considering through the mouse session number.
+
+In total, the eight factors we will be considering will be these ones:
+
+* Difference in contrasts (numeric)
+* Luck factor (categorical)
+* Side factor (categorical)
+* Mouse name (categorical)
+* Mouse session number (numeric)
+* Trial number (numeric)
+* Initial focus (numeric)
+* Overall focus (numeric)
+
+The session number will also be included to help organize the data.
+
+These can be displayed for a single trial like so. We'll use the first trial of the first session for our example.
+
+```{r message=FALSE}
+example = tibble(
+  sess.label = 0,
+  trial.label = 0,
+  cont.diff = 0,
+  luck = "Luck",
+  side = "Side",
+  mouse.name = "Name",
+  mouse.sess = 0,
+  init.focus = 0,
+  over.focus = 0,
+  ans = 0
+)
+
+example$sess.label = 1
+## For reference. Will not be used in the model.
+example$trial.label = 1
+
+ex.temp.diff = session[[1]]$contrast_left[1] - session[[1]]$contrast_right[1]
+
+example$cont.diff = abs(ex.temp.diff)
+
+if (ex.temp.diff == 0 & session[[1]]$contrast_left[1] != 0) {
+## If both of these are true, we don't have to check contrast_right.
+  luck = "Yes"
+} else {
+    example$luck = "No"
+}
+
+if (ex.temp.diff != 0) {
+  if (ex.temp.diff > 0) {
+    example$side = "Left"
+  } else {
+    example$side = "Right"
+  }
+} else {
+  example$side = "Equal"
+}
+example$mouse.name = session[[1]]$mouse_name
+
+example$mouse.sess = 1
+## Commented code below shows how you'd get the mouse's session number while for-looping through sessions.
+## This isn't useful for example purposes, so it's getting skipped for now.
+## if (i < 4) {
+##   example$mouse.sess = i
+## } else if (i < 8) {
+##   example$mouse.sess = i - 3
+## } else if (i < 12) {
+##   example$mouse.sess = i - 7
+## } else {
+##   example$mouse.sess = i - 11
+## }
+
+ex.spks = apply(session[[1]]$spks[[1]], 2, mean)
+example$init.focus = sum(ex.spks[1:10])
+example$over.focus = sum(ex.spks)
+
+example$ans = (session[[1]]$feedback_type[1] + 1)/2
+## Swapped from -1 / 1 to 0 / 1 for failure / success to make success rate calculations easier.
+## Kept as a numeric variable rather than a factor for the same reason.
+```
+
+```{r echo=FALSE, message=FALSE}
+knitr::kable(example, format = "html", table.attr = "class='table table-striped'",col.names=c("Session", "Trial", "Contrast Difference", "Luck Factor", "Side Factor", "Mouse", "Mouse's Session", "Initial Spikes", "Overall Spikes", "Feedback"))
+```
+
+*** 
+
+## Data Integration
+
+Now that we've done it once, we can make a function to extract our chosen factors from an entire session.
+
+```{r message=FALSE}
+new.sess.data = function(i) {
+  temp.sess = session[[i]]
+  new.data = tibble()
+  for (j in 1:length(temp.sess$feedback_type)) {
+    trial = tibble(
+    ## Some of these can already be filled in.
+    ## All factor levels are listed because not doing so caused a bug when preparing the test data.
+      ans = 0,
+      sess.label = i,
+      ## Putting these two first so they can be cut out more easily.
+      trial.label = j,
+      cont.diff = 0,
+      luck = "Luck",
+      side = "Side",
+      mouse.name = factor(temp.sess$mouse_name,levels = c("Cori", "Forssmann", "Hench", "Lederberg")),
+      mouse.sess = 0,
+      init.focus = 0,
+      over.focus = 0
+    )
+    trial$ans = (temp.sess$feedback_type[[j]] + 1)/2
+    ## Feedback is moved to the third column to make it easier to filter it out for the model.
+    temp.diff = temp.sess$contrast_left[j] - temp.sess$contrast_right[j]
+    trial$cont.diff = abs(temp.diff)
+    if (temp.diff == 0 & temp.sess$contrast_left[j] != 0) {
+      trial$luck = as.factor("Yes")
+    } else {
+      trial$luck = as.factor("No")
+    }
+    if (temp.diff != 0) {
+      if (temp.diff > 0) {
+        trial$side = as.factor("Left")
+      } else {
+        trial$side = as.factor("Right")
+      }
+    } else {
+      trial$side = as.factor("Equal")
+    }
+    if (i < 4) {
+      trial$mouse.sess = i
+    } else if (i < 8) {
+      trial$mouse.sess = i - 3
+    } else if (i < 12) {
+      trial$mouse.sess = i - 7
+    } else {
+      trial$mouse.sess = i - 11
+    }
+    temp.spks = apply(session[[i]]$spks[[j]], 2, mean)
+    trial$init.focus = sum(temp.spks[1:10])
+    trial$over.focus = sum(temp.spks)
+    new.data = rbind(new.data, trial)
+  }
+  return(new.data)
+}
+
+new.session6 = new.sess.data(6)
+```
+
+Shown here are the factors for the first five trials of Session 6.
+
+```{r echo=FALSE, message=FALSE}
+knitr::kable(head(new.session6, 5), format = "html", table.attr = "class='table table-striped'",col.names=c("Feedback", "Session", "Trial", "Contrast Difference", "Luck Factor", "Side Factor", "Mouse", "Mouse's Session", "Initial Spikes", "Overall Spikes"))
+```
+
+And with a function for sessions, expanding it to the entire dataset is easy.
+
+```{r message=FALSE}
+new.data.matrix = tibble()
+for (k in 1:n.session){
+  temp.new.session = new.sess.data(k)
+  new.data.matrix = rbind(new.data.matrix, temp.new.session)
+}
+```
+
+***
+
+## Predictive Modeling
+
+Since our response variable (the trial feedback) is a binomial variable where any given value is either "success" (1) or "failure" (0), we decided to use a logistic regression model. We used the glmnet package to run k-fold cross-validation in order to determine the ideal lambdas with which to penalize our model.
+
+However, before we could do that, the data had to be modified somewhat. The glmnet package doesn't recognize character / categorical variables unless they can be turned into integers; using our data as it is now would simply ignore the categorical variables, which would be disastrous considering that they're three of the six variables in our model. As such, the data must be modified so that we don't lose half of our model.
+
+The solution isn't as simple as just changing the categorical variables to integers. If, for instance, we set the side factors to be 0, 1, and 2 rather than "left", "right", and "equal", it would imply that "equal" had twice as much of an effect on the dataset as "right" did. This would heavily misrepresent our categorical variables, so it isn't an option either.
+
+Looking online led me to a [Stackoverflow post](https://stackoverflow.com/questions/30124642/i-want-to-use-cv-glmnet-from-library-glmnet-in-r-one-of-my-variables-is-a-chara) from someone with a similar issue. The answer they received was to turn each categorical variable into a number of "dummy variables" equal to the number of possible results for the categorical variable. [Further investigation in this direction](https://www.r-bloggers.com/2022/02/how-to-include-all-levels-of-a-factor-variable-in-a-model-matrix-in-r/) led me to my solution. I would construct dummy variables would have two possible values: 1 for if that variable was the selected one in a given trial, and 0 if it was any other variable in that category. This would allow glmnet to represent all of the categorical variables as integers without misrepresenting the effect of any individual category.
+
+Keeping that in mind, the data was adjusted as follows. Additionally, all of the feedback results were converted from their 0 / 1 format to a FALSE / TRUE format in order to slot better into the binomial trial.
+
+```{r message=FALSE}
+prep.for.test = function(dataset) {
+## This function can be used to better accommodate the test data later.
+## The intended input is a dataset that has already been run through new.sess.data().
+  adj.data.matrix = dataset %>% mutate(ans = (ans==1));
+  new.luck = model.matrix( ~ .-1, dataset[5])
+  new.side = model.matrix( ~ .-1, dataset[6])
+  new.mouse.name = model.matrix( ~ . + 0, dataset[7])
+  adj.data.matrix = adj.data.matrix %>% select (-c(luck, side, mouse.name))
+  adj.data.matrix = adj.data.matrix %>% bind_cols(new.luck, new.side, new.mouse.name)
+  return(adj.data.matrix)
+}
+new.prepped = prep.for.test(new.data.matrix)
+```
+
+Now that the data has been adjusted and is no longer removing the categorical variables, our data is almost ready to be used to make the prediction model. The only thing left to do is to separate out some of the data as training data and mark the rest as testing data. We'll split the data as 80% training and 20% testing.
+
+```{r message=FALSE}
+set.seed(254) ## For reproducibility
+
+prepped.sample = sample.int(n = nrow(new.prepped), size = floor(.8 * nrow(new.prepped)), replace = F)
+prepped.train = new.prepped[prepped.sample, ]
+prepped.test = new.prepped[-prepped.sample,]
+```
+
+With our data split, we're finally prepared to use the "cv.glmnet" function to run our k-fold cross validation on the training data and find the best lasso penalties for our overall model. We used the function's default value of 10 folds. After obtaining the best lambda from running this model, we constructed a logistic regression model using those penalties and used it to predict the testing data. We'll also set up a "success model" that always predicts success for comparison purposes, and we'll display a table with the accuracy of the two models on the testing data.
+
+```{r message=FALSE}
+end.model = cv.glmnet(as.matrix(prepped.train[,-c(1:2)]), prepped.train$ans, family = "binomial")
+
+run.end.prediction = function(dataset) {
+  pred1 = predict(end.model, as.matrix(dataset)[,-(1:2)], type = 'response', s = "lambda.min")
+  prediction1 = factor(pred1 > 0.5, levels = c(FALSE, TRUE))
+  return(mean(prediction1 == dataset$ans))
+}
+
+run.success.prediction = function(dataset) {
+  prediction = factor(rep(TRUE, nrow(dataset)), levels = c(FALSE, TRUE))
+  return(mean(prediction == dataset$ans))
+}
+```
+
+```{r echo=FALSE, message=FALSE}
+testresults = tibble(
+  test = c("Prediction Model", "Success Model"),
+  results = c(run.end.prediction(prepped.test), run.success.prediction(prepped.test))
+)
+knitr::kable(testresults, format = "html", table.attr = "class='table table-striped'",col.names=c("Test", "Accuracy"))
+```
+
+Our model seems like it's doing decently. Not great, but not terrible. It's a little ahead of the success model, with around a 1% increase in accuracy. Let's look at the confusion matrices for each model's performance on the testing data to get an idea of why this is.
+
+```{r echo=FALSE, message=FALSE}
+testpred = predict(end.model, as.matrix(prepped.test)[,-(1:2)], type = 'response', s = "lambda.min")
+unprepped.test = as.numeric(prepped.test$ans)
+testprediction = factor(testpred > 0.5, labels = c('0', '1'))
+## Repeating the code in the function, since we don't want the specific output the function returns.
+
+cmtest1 = confusionMatrix(as.factor(testprediction), as.factor(unprepped.test), dnn = c("Prediction", "Reference"))
+plt1 = as.data.frame(cmtest1$table)
+
+testsuccess = factor(rep(1, length(unprepped.test)), levels = c(0, 1))
+
+cmtest2 = confusionMatrix(as.factor(testsuccess), as.factor(unprepped.test), dnn = c("Prediction", "Reference"))
+plt2 = as.data.frame(cmtest2$table)
+
+ourplot.test = ggplot(plt1, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#e00707") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1")) + 
+        ggtitle("Our Model") + 
+        theme(plot.title = element_text(hjust = 0.5))
+
+successplot.test = ggplot(plt2, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#4bec13") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1")) + 
+        ggtitle("Success Model") + 
+        theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(ourplot.test, successplot.test, ncol=2)
+```
+
+The confusion matrices are actually rather similar, which probably isn't a good thing. Both of them heavily overpredict successes, with a 26.3% chance for any given positive to be a false positive for our model and a 28.8% chance for the same for the success model. The rates being so close to one another is telling: the main reason our model's false positive rate is only 26.3% isn't because our model is good; it's just because of the limited number of failures in our data, and our model heavily overpredicting successes can't return results that punish this assumption because there just aren't enough failures to go around.
+
+Building off of that, it's possible that our model selection process was seeing a 26.3% false positive rate as "acceptable" in a vacuum, not realizing the fact that the highest possible false positive rate was 28.8%. As such, the mice having a high success rate has ended up biasing our model towards success, because models that predict more failures overall end up with worse accuracy than models that predict more successes.
+
+The way that our model improves on the success model is by actually predicting failures occasionally. A true positive value has a roughly 4.4% chance of being seen as a negative by our model, while a true negative value has a roughly 15.7% chance of being seen as a negative by our model, shows that our model is better at identifying negatives when the true value is actually negative. In theory, this is good, because it implies that our model can predict negatives, but the cutoff for doing so might just be a little too low. However, since the number of true positives reported as negatives and true negatives reported as negatives are also rather close to one another (60% of our reported negatives are true negative values), it could also mean that our model is just fingering a number of trials as "negative" with a variable that doesn't actually have anything to do with predicting their true outcomes.
+
+```{r echo=FALSE, message=FALSE}
+## Math for the percentages.
+ourmodel.positiveisfalse = round(247/(247 + 692), 3)
+successmodel.positiveisfalse = round(293/(293 + 724), 3)
+ourmodel.negativefortruepositive = round(32/(32 + 692), 3)
+ourmodel.negativefortruenegative = round(46/(46 + 247), 3)
+ourmodel.truenegativefornegative = round(36/(36 + 24), 3)
+```
+
+***
+
+To further improve our understanding of our model's capabilities, let's choose two samples at random and perform this comparison on 70 randomly selected trials from each of them.
+
+```{r message=FALSE}
+set.seed(92)
+## I change the seed repeatedly in order to test various parts of the code individually.
+floor(runif(2, min=0, max=19))
+```
+So we'll be looking at Session 1 and Session 12. Let's start with the data for session 1.
+
+```{r echo=FALSE, message=FALSE}
+## Wrapping the sampling process into a function.
+seventy.random = function(session) {
+  temp.session = prep.for.test(new.sess.data(session))
+  sample.key = sample.int(n =nrow(temp.session), size = 70, replace = F)
+  return(temp.session[sample.key, ])
+}
+
+set.seed(70)
+sampled.sess1 = seventy.random(1)
+
+sess1.results = tibble(
+  test = c("Prediction Model", "Success Model"),
+  results = c(run.end.prediction(sampled.sess1), run.success.prediction(sampled.sess1))
+  )
+knitr::kable(sess1.results, format = "html", table.attr = "class='table table-striped'",
+             col.names=c("Test", "Accuracy"))
+
+sess1.model = predict(end.model, as.matrix(sampled.sess1)[,-(1:2)], type = 'response', s = "lambda.min")
+sampled.sess1.num = as.numeric(sampled.sess1$ans)
+sess1.modelresult = factor(sess1.model > 0.5, labels = c('0', '1'))
+cmtest.ours1 = confusionMatrix(as.factor(sess1.modelresult), as.factor(sampled.sess1.num), dnn = c("Prediction", "Reference"))
+plt.ours1 = as.data.frame(cmtest.ours1$table)
+
+success.sess1 = factor(rep(1, length(sampled.sess1.num)), levels = c(0, 1))
+cmtest.succ1 = confusionMatrix(as.factor(success.sess1), as.factor(sampled.sess1.num), dnn = c("Prediction", "Reference"))
+plt.succ1 = as.data.frame(cmtest.succ1$table)
+
+ourplot.1 = ggplot(plt.ours1, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#e00707") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1")) + 
+        ggtitle("Our Model") + 
+        theme(plot.title = element_text(hjust = 0.5))
+
+successplot.1 = ggplot(plt.succ1, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#4bec13") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1")) + 
+        ggtitle("Success Model") + 
+        theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(ourplot.1, successplot.1, ncol=2)
+```
+
+Our model seems to perform a decent bit better than the success model, but note how small the margins are. Our sample size of 70 means that a difference of +2 successes in total (4 fewer false positives, 2 more false negatives) had an impact of almost +3% accuracy on the original model. Additionally, this reinforces the previous notion that our model is heavily overpredicting successes. Even so, this seems encouraging; the results are in line with our previous assumption that the model is slightly better at producing true negatives than false negatives, and in general the results support the idea that our model is slightly better than the success model.
+
+Now we turn to session 12.
+
+```{r echo=FALSE, message=FALSE}
+
+set.seed(31)
+sampled.sess12 = seventy.random(12)
+
+sess12.results = tibble(
+  test = c("Prediction Model", "Success Model"),
+  results = c(run.end.prediction(sampled.sess12), run.success.prediction(sampled.sess12))
+  )
+knitr::kable(sess12.results, format = "html", table.attr = "class='table table-striped'",
+             col.names=c("Test", "Accuracy"))
+
+sess12.model = predict(end.model, as.matrix(sampled.sess12)[,-(1:2)], type = 'response', s = "lambda.min")
+sampled.sess12.num = as.numeric(sampled.sess12$ans)
+sess12.modelresult = factor(sess12.model > 0.5, labels = c('0', '1'))
+cmtest.ours12 = confusionMatrix(as.factor(sess12.modelresult), as.factor(sampled.sess12.num), dnn = c("Prediction", "Reference"))
+plt.ours12 = as.data.frame(cmtest.ours12$table)
+
+success.sess12 = factor(rep(1, length(sampled.sess12.num)), levels = c(0, 1))
+cmtest.succ12 = confusionMatrix(as.factor(success.sess12), as.factor(sampled.sess12.num), dnn = c("Prediction", "Reference"))
+plt.succ12 = as.data.frame(cmtest.succ12$table)
+
+ourplot.12 = ggplot(plt.ours12, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#e00707") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1")) + 
+        ggtitle("Our Model") + 
+        theme(plot.title = element_text(hjust = 0.5))
+
+successplot.12 = ggplot(plt.succ12, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#4bec13") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1")) + 
+        ggtitle("Success Model") + 
+        theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(ourplot.12, successplot.12, ncol=2)
+```
+
+These results are less encouraging. From this confusion matrix alone, it seems like our model is essentially, as we suspected, marking some trials as failures based on a condition that isn't properly correlated with actual failures. The fact that our model is so clearly performing worse than the success model is also rather concerning. Since these results go counter to the results of our other tests, it would be easy to write this off as receiving an unlucky or particularly questionable sample, but the reasons that the model seems to be performing worse are also in line with the concerns we already had.
+
+***
+
+## Performance on Test Data
+
+The test data is a good opportunity to determine whether our model is performing in the manner that our testing data and session 1 sample imply, or if it's instead performing in the manner that our session 12 sample implies.
+
+Let's start by importing the test data. Due to how I coded the previous functions, the test data has to be imported into the list of sessions in order for the previously-made functions to read them properly. As such, the two sets of test data will be referred to as "session 19" and "session 20" respectively in the code, with "session 19" representing the test data from session 1 and "session 20" representing the test data from session 18.
+
+```{r message=FALSE}
+session[[19]]=readRDS(paste('./Data/test1.rds'))
+session[[20]]=readRDS(paste('./Data/test2.rds'))
+```
+
+Now that the test data is imported, let's run it through both our model and the success model (for comparison purposes) using the function's we've already made. This provides the following results:
+
+```{r echo=FALSE, message=FALSE}
+test.data.results = tibble(
+  test = c("Prediction Model", "Success Model"),
+  test1results = c(run.end.prediction(prep.for.test(new.sess.data(19))),
+                   run.success.prediction(prep.for.test(new.sess.data(19)))
+  ),
+  test18results = c(run.end.prediction(prep.for.test(new.sess.data(20))),
+                    run.success.prediction(prep.for.test(new.sess.data(20)))
+  )
+)
+knitr::kable(test.data.results, format = "html", table.attr = "class='table table-striped'",
+             col.names=c("Test", "Session 1 Test Data Accuracy", "Session 18 Test Data Accuracy"))
+```
+
+This is significantly worse performance from our model than anything we've done so far. For the session 18 test data, it's only on par with the success model, and for the session 1 test data, it's a good 8% behind. The session 18 test data is the one that raises the most obvious questions, as it's important to check whether the results were actually identical or simply a different distribution of successes and failures, so let's take a look at its confusion matrices.
+
+```{r echo=FALSE, message=FALSE}
+test2.alldata = prep.for.test(new.sess.data(20))
+test2.model = predict(end.model, as.matrix(test2.alldata)[,-(1:2)], type = 'response', s = "lambda.min")
+sampled.test2.num = as.numeric(test2.alldata$ans)
+test2.modelresult = factor(as.numeric(test2.model > 0.5), levels = c(0, 1))
+## This change to the model result is because the original code wasn't prepared to only receive one factor level.
+cmtest.ourstest2 = confusionMatrix(as.factor(test2.modelresult), as.factor(sampled.test2.num), dnn = c("Prediction", "Reference"))
+plt.ourstest2 = as.data.frame(cmtest.ourstest2$table)
+
+success.test2 = factor(rep(1, length(sampled.test2.num)), levels = c(0, 1))
+cmtest.succtest2 = confusionMatrix(as.factor(success.test2), as.factor(sampled.test2.num), dnn = c("Prediction", "Reference"))
+plt.succtest2 = as.data.frame(cmtest.succtest2$table)
+
+ourplot.test2 = ggplot(plt.ourstest2, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#e00707") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1")) + 
+        ggtitle("Our Model") + 
+        theme(plot.title = element_text(hjust = 0.5))
+
+successplot.test2 = ggplot(plt.succtest2, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#4bec13") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1")) + 
+        ggtitle("Success Model") + 
+        theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(ourplot.test2, successplot.test2, ncol=2)
+```
+
+It seems that, rather than getting exactly equal results due to predicting a number of true negatives and cancelling those successes out with an equal number of false negatives, our model just didn't predict a single failure. There's not much information to be gathered from here; it displays that our model is overpredicting successes, but we already knew that much. Let's turn our attention to the session 1 test data.
+
+```{r echo=FALSE, message=FALSE}
+test1.alldata = prep.for.test(new.sess.data(19))
+test1.model = predict(end.model, as.matrix(test1.alldata)[,-(1:2)], type = 'response', s = "lambda.min")
+sampled.test1.num = as.numeric(test1.alldata$ans)
+test1.modelresult = factor(as.numeric(test1.model > 0.5), levels = c(0, 1))
+cmtest.ourstest1 = confusionMatrix(as.factor(test1.modelresult), as.factor(sampled.test1.num), dnn = c("Prediction", "Reference"))
+plt.ourstest1 = as.data.frame(cmtest.ourstest1$table)
+
+success.test1 = factor(rep(1, length(sampled.test1.num)), levels = c(0, 1))
+cmtest.succtest1 = confusionMatrix(as.factor(success.test1), as.factor(sampled.test1.num), dnn = c("Prediction", "Reference"))
+plt.succtest1 = as.data.frame(cmtest.succtest2$table)
+
+ourplot.test1 = ggplot(plt.ourstest1, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#e00707") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1")) + 
+        ggtitle("Our Model") + 
+        theme(plot.title = element_text(hjust = 0.5))
+
+successplot.test1 = ggplot(plt.succtest1, aes(Reference, Prediction, fill= Freq)) +
+        geom_tile() + geom_text(aes(label=Freq)) +
+        scale_fill_gradient(low="white", high="#4bec13") +
+        labs(x = "Reference",y = "Prediction") +
+        scale_x_discrete(labels=c("0","1")) +
+        scale_y_discrete(labels=c("0","1")) + 
+        ggtitle("Success Model") + 
+        theme(plot.title = element_text(hjust = 0.5))
+
+grid.arrange(ourplot.test1, successplot.test1, ncol=2)
+```
+
+To be fair, this is the only way that our model could have possibly been worse than the success model: by predicting more false negatives and not enough true negatives. Our model performing so horribly here further supports the evidence presented in our test of the 70 random trials from session 12: it seems that whatever criteria is causing trials to be marked as "failures" isn't very well-correlated with the actual trials where mice failed.
+
+***
+
+## Conclusion
+
+**Discussion of Results**
+
+The prediction model's performance was spotty. It performed somewhat passably on the original separated testing data and small samples from two random sessions, but it performed utterly abysmally on the testing data.
+
+The two problems that kept popping up were as follows:
+
+* The model overpredicted successes.
+* The model predicted failures with a method not properly correlated to actual failures.
+
+Let's look at the coefficients of our model.
+
+```{r message=FALSE}
+coef(end.model, s = "lambda.min")
+## Couldn't figure out how to take values out of this, so sadly I'm stuck with default R output.
+```
+
+Focusing on the first problem, one thing that's immediately notable is that the luck factor being a "no" added roughly 0.8 to the estimated probability, which becomes problematic when the luck factor being a "yes" is such a rare occurrence. If the luck factor is included in a future model, it should be constructed similarly to the other categorical variables, where one of the values is empty in order to represent a "default". This would allow the luck factor returning "yes" to be adjusted on top of everything else; in this case, the luck factor of "yes" is extremely small and is only really shown by the absence of the luck factor of "no".
+
+Focusing on the second problem, the focus coefficients are extremely large; initial focus has a coefficient of almost -7 and overall focus has a coefficient of around 2 in a model meant to predict values from 0 to 1! These values clearly have an extremely strong effect on the data, to the point that they're overpowering many of the other variables. As our second problem is that the prediction of failures isn't correlated to actual failures, values these strong whose presence and absence are some of the stronger determinants of our end result should be given more scrutiny, and perhaps we should consider changing which time bins are being totalled for each.
+
+Following that line of thinking, the data gets a huge -0.44 penalty simply for originating from one specific mouse, Cori, and receives a similarly large penalty of -0.2 for coming from Hench. There are two ways of reading this. The first is that these two mice might have significantly worse success rates than the others, and the data is representing that. The second is to take a step back and consider the first problem; we're *overestimating* success. It's entirely possible that the large penalties are representing the data producing a result that's way too high for these mice, which would force the model to give them penalties just to get them back inside of the range of 0 to 1.
+
+This massive penalty that Cori's trials receive is also almost certainly the reason that we predicted so many false negatives for the session 1 test data; Cori was the subject in that session.
+
+If we were to do more exploratory data analysis, we would focus on these variables in order to improve our model.
+
+***
+
+**Self-Reflection**
+
+In retrospect, there was very little "exploring" in the "exploratory data analysis". There was so little, in fact, that I removed "exploratory" from the title entirely. The first problem I ran into was that I couldn't see what any of the graphs I could include would meaningfully represent. I couldn't figure out how to do PCA on the neuron spikes when so much data is missing (due to the sessions looking at different neurons) that I couldn't figure out how to take the neurons as factors. I could have taken the contrast levels or time bin totals as factors instead, but the resulting diagram wouldn't represent anything that I had the capacity to verbally explain.
+
+Once I had actually decided on variables, I got a number of ideas on graphs or tables I could include as exploratory analysis. I wanted to add EDA after the data integration where I did the following with my newly prepared dataset:
+
+* Two-factor ANOVA comparing the names of the mice to the side factor in order to determine if any mice had an easier or harder time with higher contrasts on a specific side.
+* Single-factor ANOVA comparing the overall success rates of the mice.
+* Linear regression comparing the number of sessions the mouse had undergone when taking the trial to the success rates.
+* Linear regressions comparing the initial or overall focus to the success rates.
+
+Unfortunately, the second problem I ran into was a lack of time. Due to a combination of me starting too late, getting caught up in bug fixing, and trying to ensure that the actual testing of the data was working properly, I didn't manage to get any of these done. This massively hurt my analysis of my model's performance, as I didn't have a good idea of where to look in order to potentially improve it.
+
+* The linear regressions for the focus variables would have provided justifications for whether the extremely large init.focus and over.focus coefficients were problematic.
+* The single-factor ANOVA would have provided justifications for whether the exact values each mouse coefficient had were representative of the training data.
+* The linear regression for mouse sessions would have provided a justification for whether the mouse session's coefficent being rather large compared to the others was problematic.
+
+Since my exploratory data analysis was lacking, I tried to focus on justifications in my data analysis. I thought for a long time about what variables I was supposed to include, as well as how to incorporate the neurons, but for a while I had it in my head that I was supposed to be figuring out "how to determine which neurons were good predictors", which absolutely was not the project goal. I eventually ended up mostly summing up the neurons into singular variables and focusing on categorical variables instead, and (as previously mentioned) the lack of EDA left me with little to go off of when trying to determine how to improve my clearly faulty model.
+
+Even though I explained my variable choices very heavily, I didn't explain many of my choices for model selection, mostly because I wasn't making particularly informed ones and was just going with the methods that seemed like they had the best chance of not causing huge errors in my final result.
+
+***
+
+## Acknowledgements and Appendix
+
+[Github Repository](https://github.com/S-A-M-Pereira/STA141A-Final-Project)
+
+Origin of Dataset & Information about Experimental Structure
+
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+
+Various Online Resources Used:
+
+* [R Markdown Formatting](https://rmarkdown.rstudio.com/authoring_basics.html)
+* [toString() for the Brain Area table](https://sparkbyexamples.com/r-programming/convert-r-list-to-string-with-examples/)
+* [Help with knitr::kable](https://bookdown.org/yihui/rmarkdown-cookbook/kable.html)
+* [Categorical variables in glmnet](https://stackoverflow.com/questions/30124642/i-want-to-use-cv-glmnet-from-library-glmnet-in-r-one-of-my-variables-is-a-chara), referenced in text
+* [model.matrix() help](https://www.r-bloggers.com/2022/02/how-to-include-all-levels-of-a-factor-variable-in-a-model-matrix-in-r/), referenced in text
+* [Connecting model.matrix() to existing data](https://stackoverflow.com/questions/51936962/how-to-append-a-matrix-of-columns-to-a-data-frame-in-dplyr)
+* [Help with dropping specific columns](https://stackoverflow.com/questions/35839408/r-dplyr-drop-multiple-columns)
+* [glmnet() syntax help](https://glmnet.stanford.edu/reference/predict.cv.glmnet.html)
+* [Centering confusion matrix titles](https://stackoverflow.com/questions/40675778/center-plot-title-in-ggplot2)
+* [Random integer generation for session selection](http://www.cookbook-r.com/Numbers/Generating_random_numbers/)
+* [Side-by-side plots in ggplot2](https://stackoverflow.com/questions/1249548/side-by-side-plots-with-ggplot2)
+* [Hyperlinks](https://stackoverflow.com/questions/29787850/how-do-i-add-a-url-to-r-markdown)
+
+Session data, test data, and some of the included code were all taken from course materials.
